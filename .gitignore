@@ -1,0 +1,40 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Кэши
+.cache/
+.hf-cache/
+.pip-temp/
+
+# Hugging Face и модели
+checkpoints/
+outputs/
+whisper-*-finetuned/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# MLflow
+mlruns/
+mlartifacts/
+mlflow.db
+
+# Данные и аудио
+data/
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Секреты
+.env
+*.env
+
+# IDE
+.vscode/
