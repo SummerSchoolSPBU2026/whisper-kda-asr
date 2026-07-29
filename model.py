@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoProcessor, WhisperConfig, WhisperModel, GenerationConfig
+from transformers import AutoProcessor, WhisperModel, GenerationConfig
 from fla.models import KDAConfig
 import torch.nn as nn
 from fla.layers.kda import KimiDeltaAttention
@@ -10,7 +10,7 @@ from fla.models.utils import Cache, FLAGenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import torch.nn.functional as F
 from transformers.modeling_outputs import Seq2SeqLMOutput
-from utils import shift_tokens_right, resize_audio_attention_mask
+from model.utils import shift_tokens_right, resize_audio_attention_mask
 
 WHISPER_MODEL_NAME = "openai/whisper-tiny"
 
@@ -18,7 +18,6 @@ def create_kda_config(
     tokenizer,
     max_target_length=448,
     freeze_encoder=True,
-    random_init_encoder=False,
 ):
     required_ids = {
         "pad_token_id": tokenizer.pad_token_id,
@@ -76,7 +75,6 @@ def create_kda_config(
 
         whisper_model_name=WHISPER_MODEL_NAME,
         freeze_encoder=freeze_encoder,
-        random_init_encoder=random_init_encoder,
     )
 
 class KDACrossAttentionBlock(nn.Module):
@@ -575,17 +573,10 @@ class WhisperKDAModel(KDAPreTrainedModel):
     ):
         super().__init__(config)
 
-        if getattr(config, "random_init_encoder", False):
-            whisper_config = WhisperConfig.from_pretrained(
-                config.whisper_model_name
-            )
-            whisper_config._attn_implementation = "sdpa"
-            whisper = WhisperModel(whisper_config)
-        else:
-            whisper = WhisperModel.from_pretrained(
-                config.whisper_model_name,
-                attn_implementation="sdpa",
-            )
+        whisper = WhisperModel.from_pretrained(
+            config.whisper_model_name,
+            attn_implementation="sdpa",
+        )
 
         self.whisper_config = whisper.config
         self.encoder = whisper.encoder
@@ -850,8 +841,8 @@ class WhisperKDAModel(KDAPreTrainedModel):
             )
 
         del pretrained_decoder
-    
-    
+
+
     @torch.no_grad()
     def generate(
         self,
