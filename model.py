@@ -10,23 +10,36 @@ from fla.models.utils import Cache, FLAGenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import torch.nn.functional as F
 from transformers.modeling_outputs import Seq2SeqLMOutput
-from utils import shift_tokens_right, resize_audio_attention_mask
+from model.utils import shift_tokens_right, resize_audio_attention_mask
 
 WHISPER_MODEL_NAME = "openai/whisper-tiny"
 
-def create_kda_config(tokenizer):
-    decoder_start_token_id = tokenizer.convert_tokens_to_ids(
-        "<|startoftranscript|>"
-    )
+def create_kda_config(
+    tokenizer,
+    max_target_length=448,
+    freeze_encoder=True,
+):
+    required_ids = {
+        "pad_token_id": tokenizer.pad_token_id,
+        "bos_token_id": tokenizer.bos_token_id,
+        "eos_token_id": tokenizer.eos_token_id,
+    }
 
-    decoder_prompt_ids = [
-        token_id
-        for _, token_id in tokenizer.get_decoder_prompt_ids(
-            language="russian",
-            task="transcribe",
-            no_timestamps=True,
-        )
+    missing = [
+    name
+    for name, token_id in required_ids.items()
+    if token_id is None
     ]
+
+    if missing:
+        raise ValueError(
+            f"У токенизатора отсутствуют специальные токены: {missing}"
+        )
+
+    if len(set(required_ids.values())) != len(required_ids):
+        raise ValueError(
+            "PAD, BOS и EOS должны иметь разные token ID"
+        )
 
     return KDAConfig(
         vocab_size=len(tokenizer),
@@ -55,13 +68,13 @@ def create_kda_config(tokenizer):
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
 
-        decoder_start_token_id=decoder_start_token_id,
-        decoder_prompt_ids=decoder_prompt_ids,
-        max_target_length=448,
+        decoder_start_token_id=tokenizer.bos_token_id,
+        decoder_prompt_ids=[],
+        max_target_length=max_target_length,
         is_encoder_decoder=True,
 
         whisper_model_name=WHISPER_MODEL_NAME,
-        freeze_encoder=True,
+        freeze_encoder=freeze_encoder,
     )
 
 class KDACrossAttentionBlock(nn.Module):
@@ -584,6 +597,91 @@ class WhisperKDAModel(KDAPreTrainedModel):
             past_key_values=decoder_outputs.past_key_values,
             encoder_last_hidden_state=encoder_hidden_states,
         )
+    
+    def load_pretrained_decoder(
+      self,
+      checkpoint_path,
+    ):
+        pretrained_decoder = (
+            KDACrossAttentionDecoder.from_pretrained(
+                checkpoint_path
+            )
+        )
+
+        architecture_fields = (
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_heads",
+            "head_dim",
+            "intermediate_size",
+            "num_v_heads",
+            "expand_v",
+            "use_short_conv",
+            "conv_size",
+            "pad_token_id",
+            "bos_token_id",
+            "eos_token_id",
+        )
+
+        mismatches = []
+
+        for field in architecture_fields:
+            expected = getattr(self.config, field)
+            actual = getattr(
+                pretrained_decoder.config,
+                field,
+            )
+
+            if expected != actual:
+                mismatches.append(
+                    f"{field}: ASR={expected}, checkpoint={actual}"
+                )
+
+        if mismatches:
+            raise ValueError(
+                "Decoder checkpoint несовместим:\n"
+                + "\n".join(mismatches)
+            )
+
+        pretrained_state = {
+            name: tensor
+            for name, tensor
+            in pretrained_decoder.state_dict().items()
+            if "cross_attn" not in name
+        }
+
+        incompatible = self.decoder.load_state_dict(
+            pretrained_state,
+            strict=False,
+        )
+
+        unexpected = incompatible.unexpected_keys
+
+        invalid_missing = [
+            name
+            for name in incompatible.missing_keys
+            if "cross_attn" not in name
+        ]
+
+        if unexpected or invalid_missing:
+            raise RuntimeError(
+                "Ошибка загрузки decoder checkpoint: "
+                f"missing={invalid_missing}, "
+                f"unexpected={unexpected}"
+            )
+
+        self.decoder.tie_weights()
+
+        if (
+            self.decoder.lm_head.weight
+            is not self.decoder.model.embeddings.weight
+        ):
+            raise RuntimeError(
+                "После загрузки потеряна связь embeddings/lm_head"
+            )
+
+        del pretrained_decoder
     
     
     @torch.no_grad()
