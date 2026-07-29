@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoProcessor
+from transformers import AutoProcessor, WhisperModel, GenerationConfig
 from fla.models import KDAConfig
 import torch.nn as nn
 from fla.layers.kda import KimiDeltaAttention
@@ -9,13 +9,25 @@ from fla.models.kda.modeling_kda import KDAPreTrainedModel
 from fla.models.utils import Cache, FLAGenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import torch.nn.functional as F
-from transformers import WhisperModel
 from transformers.modeling_outputs import Seq2SeqLMOutput
 from utils import shift_tokens_right, resize_audio_attention_mask
 
 WHISPER_MODEL_NAME = "openai/whisper-tiny"
 
 def create_kda_config(tokenizer):
+    decoder_start_token_id = tokenizer.convert_tokens_to_ids(
+        "<|startoftranscript|>"
+    )
+
+    decoder_prompt_ids = [
+        token_id
+        for _, token_id in tokenizer.get_decoder_prompt_ids(
+            language="russian",
+            task="transcribe",
+            no_timestamps=True,
+        )
+    ]
+
     return KDAConfig(
         vocab_size=len(tokenizer),
         hidden_size=384,
@@ -42,6 +54,14 @@ def create_kda_config(tokenizer):
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+
+        decoder_start_token_id=decoder_start_token_id,
+        decoder_prompt_ids=decoder_prompt_ids,
+        max_target_length=448,
+        is_encoder_decoder=True,
+
+        whisper_model_name=WHISPER_MODEL_NAME,
+        freeze_encoder=True,
     )
 
 class KDACrossAttentionBlock(nn.Module):
@@ -127,7 +147,7 @@ class KDACrossAttentionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
         decoder_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
         past_key_values=None,
@@ -135,7 +155,7 @@ class KDACrossAttentionBlock(nn.Module):
         output_attentions: bool = False,
         **kwargs,
     ):
-        if encoder_hidden_states.size(-1) != self.config.hidden_size:
+        if (encoder_hidden_states is not None and encoder_hidden_states.size(-1) != self.config.hidden_size):
             raise ValueError(
                 "Размер encoder_hidden_states должен совпадать с "
                 f"hidden_size={self.config.hidden_size}, получено "
@@ -156,41 +176,48 @@ class KDACrossAttentionBlock(nn.Module):
             **kwargs,
         )
 
+        next_norm = (
+            self.cross_attn_norm
+            if encoder_hidden_states is not None
+            else self.mlp_norm
+        )
+
         hidden_states, residual = self._add_residual_and_norm(
             hidden_states,
             residual,
-            self.cross_attn_norm,
+            next_norm,
         )
 
         # cross-attention
         
-        encoder_padding_mask = None
+        if encoder_hidden_states is not None:
+            encoder_padding_mask = None
 
-        if encoder_attention_mask is not None:
-            expected_shape = encoder_hidden_states.shape[:2]
+            if encoder_attention_mask is not None:
+                expected_shape = encoder_hidden_states.shape[:2]
 
-            if encoder_attention_mask.shape != expected_shape:
-                raise ValueError(
-                    "encoder_attention_mask должна иметь форму "
-                    f"{expected_shape}, получено "
-                    f"{encoder_attention_mask.shape}"
-                )
+                if encoder_attention_mask.shape != expected_shape:
+                    raise ValueError(
+                        "encoder_attention_mask должна иметь форму "
+                        f"{expected_shape}, получено "
+                        f"{encoder_attention_mask.shape}"
+                    )
 
-            encoder_padding_mask = ~encoder_attention_mask.bool()
+                encoder_padding_mask = ~encoder_attention_mask.bool()
 
-        cross_output, _ = self.cross_attn(
-            query=hidden_states,
-            key=encoder_hidden_states,
-            value=encoder_hidden_states,
-            key_padding_mask=encoder_padding_mask,
-            need_weights=False,
-        )
+            cross_output, _ = self.cross_attn(
+                query=hidden_states,
+                key=encoder_hidden_states,
+                value=encoder_hidden_states,
+                key_padding_mask=encoder_padding_mask,
+                need_weights=False,
+            )
 
-        hidden_states, residual = self._add_residual_and_norm(
-              cross_output,
-              residual,
-              self.mlp_norm,
-          )
+            hidden_states, residual = self._add_residual_and_norm(
+                cross_output,
+                residual,
+                self.mlp_norm,
+            )
 
         # Gated MLP / SwiGLU
 
@@ -285,21 +312,18 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
     def forward(
         self,
         input_ids,
-        encoder_hidden_states,
         decoder_attention_mask=None,
         encoder_attention_mask=None,
         past_key_values=None,
         use_cache=None,
         return_dict=True,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        labels=None,
         **kwargs,
     ):
         if input_ids is None:
             raise ValueError("Необходимо передать input_ids")
-
-        if encoder_hidden_states is None:
-            raise ValueError(
-                "Необходимо передать encoder_hidden_states"
-            )
 
         use_cache = (
             self.config.use_cache
@@ -338,25 +362,47 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
         hidden_states = self.model.norm(hidden_states)
         logits = self.lm_head(hidden_states)
 
+        loss = None
+        if labels is not None:
+            shift_logits = logits[:, :-1].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.float().reshape(-1, shift_logits.size(-1)),
+                shift_labels.reshape(-1),
+                ignore_index=-100,
+            )
+
         if not return_dict:
             return logits, past_key_values
 
         return CausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             past_key_values=past_key_values,
         )
 
-class WhisperKDAModel(nn.Module):
+class WhisperKDAModel(KDAPreTrainedModel):
+    config_class = KDAConfig
+    base_model_prefix = ""
+    main_input_name = "input_features"
+    supports_gradient_checkpointing = False
+
+    _no_split_modules = ["KDACrossAttentionBlock"]
+
+    _tied_weights_keys = {
+        "decoder.lm_head.weight":
+        "decoder.model.embeddings.weight"
+    }
+
     def __init__(
         self,
-        kda_config,
-        whisper_model_name=WHISPER_MODEL_NAME,
-        freeze_encoder=True,
+        config,
     ):
-        super().__init__()
+        super().__init__(config)
 
         whisper = WhisperModel.from_pretrained(
-            whisper_model_name,
+            config.whisper_model_name,
             attn_implementation="sdpa",
         )
 
@@ -364,7 +410,7 @@ class WhisperKDAModel(nn.Module):
         self.encoder = whisper.encoder
 
         encoder_hidden_size = whisper.config.d_model
-        decoder_hidden_size = kda_config.hidden_size
+        decoder_hidden_size = config.hidden_size
 
         if encoder_hidden_size == decoder_hidden_size:
             self.encoder_projection = nn.Identity()
@@ -375,12 +421,23 @@ class WhisperKDAModel(nn.Module):
                 bias=False,
             )
 
-        self.decoder = KDACrossAttentionDecoder(kda_config)
+        self.decoder = KDACrossAttentionDecoder(config)
 
         self.encoder_is_frozen = False
 
-        if freeze_encoder:
+        if config.freeze_encoder:
             self.freeze_encoder()
+        
+        self.generation_config = GenerationConfig(
+            max_length=config.max_target_length,
+            num_beams=1,
+            do_sample=False,
+            use_cache=True,
+            decoder_start_token_id=config.decoder_start_token_id,
+            pad_token_id=config.pad_token_id,
+            bos_token_id=config.bos_token_id,
+            eos_token_id=config.eos_token_id,
+        )
 
     def freeze_encoder(self):
         self.encoder.requires_grad_(False)
@@ -389,6 +446,18 @@ class WhisperKDAModel(nn.Module):
     def unfreeze_encoder(self):
         self.encoder.requires_grad_(True)
         self.encoder_is_frozen = False
+
+    def get_encoder(self):
+      return self.encoder
+
+    def get_decoder(self):
+        return self.decoder
+
+    def get_input_embeddings(self):
+        return self.decoder.get_input_embeddings()
+
+    def get_output_embeddings(self):
+        return self.decoder.get_output_embeddings()
 
     def encode(
         self,
@@ -420,6 +489,14 @@ class WhisperKDAModel(nn.Module):
 
         return encoder_hidden_states, encoder_attention_mask
 
+    def train(self, mode=True):
+        super().train(mode)
+
+        if self.encoder_is_frozen:
+            self.encoder.eval()
+        
+        return self
+
     def forward(
         self,
         input_features=None,
@@ -432,6 +509,7 @@ class WhisperKDAModel(nn.Module):
         past_key_values=None,
         use_cache=None,
         return_dict=True,
+        **kwargs,
     ):
         if encoder_hidden_states is None:
             if input_features is None:
@@ -461,7 +539,7 @@ class WhisperKDAModel(nn.Module):
                 labels=labels,
                 pad_token_id=self.decoder.config.pad_token_id,
                 decoder_start_token_id=(
-                    self.whisper_config.decoder_start_token_id
+                    self.config.decoder_start_token_id
                 ),
             )
 
@@ -506,3 +584,192 @@ class WhisperKDAModel(nn.Module):
             past_key_values=decoder_outputs.past_key_values,
             encoder_last_hidden_state=encoder_hidden_states,
         )
+    
+    
+    @torch.no_grad()
+    def generate(
+        self,
+        input_features=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        generation_config=None,
+        max_length=None,
+        max_new_tokens=None,
+        num_beams=None,
+        do_sample=None,
+        use_cache=None,
+        **kwargs,
+    ):
+        if input_features is None:
+            raise ValueError(
+                "Для генерации необходимо передать input_features"
+            )
+
+        generation_config = (
+            generation_config or self.generation_config
+        )
+
+        num_beams = (
+            generation_config.num_beams
+            if num_beams is None
+            else num_beams
+        )
+
+        do_sample = (
+            generation_config.do_sample
+            if do_sample is None
+            else do_sample
+        )
+
+        use_cache = (
+            generation_config.use_cache
+            if use_cache is None
+            else use_cache
+        )
+
+        if num_beams != 1:
+            raise NotImplementedError(
+                "KDA cache пока поддерживается только "
+                "для greedy decoding: num_beams=1"
+            )
+
+        if do_sample:
+            raise NotImplementedError(
+                "Sampling пока не реализован"
+            )
+
+        device = next(self.parameters()).device
+
+        input_features = input_features.to(device)
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+
+        was_training = self.training
+        self.eval()
+
+        try:
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=(device.type == "cuda"),
+            ):
+                (
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                ) = self.encode(
+                    input_features=input_features,
+                    attention_mask=attention_mask,
+                )
+
+            batch_size = input_features.size(0)
+
+            if decoder_input_ids is None:
+                prompt_ids = [
+                    self.config.decoder_start_token_id,
+                    *self.config.decoder_prompt_ids,
+                ]
+
+                generated_ids = torch.tensor(
+                    prompt_ids,
+                    dtype=torch.long,
+                    device=device,
+                ).unsqueeze(0).repeat(batch_size, 1)
+            else:
+                generated_ids = decoder_input_ids.to(device)
+
+            if max_new_tokens is None:
+                max_new_tokens = generation_config.max_new_tokens
+
+            if max_length is None:
+                max_length = generation_config.max_length
+
+            if max_new_tokens is not None:
+                stopping_length = (
+                    generated_ids.size(1) + max_new_tokens
+                )
+            elif max_length is not None:
+                stopping_length = max_length
+            else:
+                raise ValueError(
+                    "Нужно установить max_new_tokens или max_length"
+                )
+
+            if stopping_length <= generated_ids.size(1):
+                raise ValueError(
+                    "Длина генерации должна быть больше длины prompt"
+                )
+
+            eos_token_id = self.config.eos_token_id
+            if eos_token_id is None:
+                raise ValueError("eos_token_id не установлен")
+
+            pad_token_id = (
+                self.config.pad_token_id
+                if self.config.pad_token_id is not None
+                else eos_token_id
+            )
+
+            finished = torch.zeros(
+                batch_size,
+                dtype=torch.bool,
+                device=device,
+            )
+
+            past_key_values = None
+
+            while generated_ids.size(1) < stopping_length:
+                if use_cache and past_key_values is not None:
+                    step_input_ids = generated_ids[:, -1:]
+                else:
+                    step_input_ids = generated_ids
+
+                decoder_attention_mask = torch.ones_like(
+                    step_input_ids,
+                    dtype=torch.long,
+                )
+
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=(device.type == "cuda"),
+                ):
+                    outputs = self.decoder(
+                        input_ids=step_input_ids,
+                        encoder_hidden_states=encoder_hidden_states,
+                        decoder_attention_mask=decoder_attention_mask,
+                        encoder_attention_mask=encoder_attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        return_dict=True,
+                    )
+
+                next_token = outputs.logits[:, -1].argmax(
+                    dim=-1,
+                    keepdim=True,
+                )
+
+                next_token = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(next_token, eos_token_id),
+                    next_token,
+                )
+
+                generated_ids = torch.cat(
+                    [generated_ids, next_token],
+                    dim=1,
+                )
+
+                finished |= next_token.squeeze(1).eq(
+                    eos_token_id
+                )
+
+                past_key_values = outputs.past_key_values
+
+                if finished.all():
+                    break
+
+            return generated_ids
+
+        finally:
+            self.train(was_training)
