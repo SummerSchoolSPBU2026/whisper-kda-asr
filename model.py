@@ -44,34 +44,6 @@ def create_kda_config(tokenizer):
         eos_token_id=tokenizer.eos_token_id,
     )
 
-config = KDAConfig(
-    vocab_size=len(tokenizer),
-    hidden_size=384,
-    num_hidden_layers=4,
-    num_heads=6,
-    head_dim=64,
-    num_v_heads=6,
-    expand_v=1.0,
-    intermediate_size=1024,
-
-    attn_mode="chunk",
-    attn=None,
-    use_short_conv=True,
-    conv_size=4,
-    norm_eps=1e-6,
-    attnres_block_size=None,
-
-    tie_word_embeddings=True,
-    use_cache=False,
-    fuse_norm=True,
-    fuse_swiglu=True,
-    fuse_cross_entropy=False,
-
-    pad_token_id=tokenizer.pad_token_id,
-    bos_token_id=tokenizer.bos_token_id,
-    eos_token_id=tokenizer.eos_token_id,
-)
-
 class KDACrossAttentionBlock(nn.Module):
     def __init__(self, config: KDAConfig, layer_idx: int):
         super().__init__()
