@@ -136,6 +136,127 @@ class KDACrossAttentionBlock(nn.Module):
               hidden_act=config.hidden_act,
               fuse_swiglu=config.fuse_swiglu,
         )
+
+    def prepare_cross_attention_key_value(
+        self,
+        encoder_hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project encoder K/V once for autoregressive decoding."""
+        _, key_weight, value_weight = self.cross_attn.in_proj_weight.chunk(
+            3,
+            dim=0,
+        )
+
+        key_bias = value_bias = None
+        if self.cross_attn.in_proj_bias is not None:
+            _, key_bias, value_bias = self.cross_attn.in_proj_bias.chunk(
+                3,
+                dim=0,
+            )
+
+        key = F.linear(
+            encoder_hidden_states,
+            key_weight,
+            key_bias,
+        )
+        value = F.linear(
+            encoder_hidden_states,
+            value_weight,
+            value_bias,
+        )
+
+        batch_size, source_length, _ = key.shape
+        num_heads = self.cross_attn.num_heads
+        head_dim = self.cross_attn.head_dim
+
+        key = key.view(
+            batch_size,
+            source_length,
+            num_heads,
+            head_dim,
+        ).transpose(1, 2)
+        value = value.view(
+            batch_size,
+            source_length,
+            num_heads,
+            head_dim,
+        ).transpose(1, 2)
+
+        return key, value
+
+    def _cross_attention_from_key_value(
+        self,
+        hidden_states: torch.Tensor,
+        key_value: tuple[torch.Tensor, torch.Tensor],
+        encoder_attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        query_weight, _, _ = self.cross_attn.in_proj_weight.chunk(
+            3,
+            dim=0,
+        )
+
+        query_bias = None
+        if self.cross_attn.in_proj_bias is not None:
+            query_bias, _, _ = self.cross_attn.in_proj_bias.chunk(
+                3,
+                dim=0,
+            )
+
+        query = F.linear(
+            hidden_states,
+            query_weight,
+            query_bias,
+        )
+
+        batch_size, target_length, _ = query.shape
+        num_heads = self.cross_attn.num_heads
+        head_dim = self.cross_attn.head_dim
+
+        query = query.view(
+            batch_size,
+            target_length,
+            num_heads,
+            head_dim,
+        ).transpose(1, 2)
+
+        key, value = key_value
+        attention_mask = None
+
+        if encoder_attention_mask is not None:
+            expected_shape = (
+                batch_size,
+                key.size(2),
+            )
+
+            if encoder_attention_mask.shape != expected_shape:
+                raise ValueError(
+                    "encoder_attention_mask должна иметь форму "
+                    f"{expected_shape}, получено "
+                    f"{encoder_attention_mask.shape}"
+                )
+
+            # SDPA boolean masks use True for positions that may participate.
+            attention_mask = encoder_attention_mask.to(
+                dtype=torch.bool,
+                device=query.device,
+            )[:, None, None, :]
+
+        cross_output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+
+        cross_output = cross_output.transpose(1, 2).reshape(
+            batch_size,
+            target_length,
+            self.config.hidden_size,
+        )
+
+        return self.cross_attn.out_proj(cross_output)
     
     def _add_residual_and_norm(
         self,
@@ -165,6 +286,9 @@ class KDACrossAttentionBlock(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         decoder_attention_mask: torch.Tensor | None = None,
         encoder_attention_mask: torch.Tensor | None = None,
+        cross_attention_key_value: (
+            tuple[torch.Tensor, torch.Tensor] | None
+        ) = None,
         past_key_values=None,
         use_cache: bool = False,
         output_attentions: bool = False,
@@ -206,27 +330,34 @@ class KDACrossAttentionBlock(nn.Module):
         # cross-attention
         
         if encoder_hidden_states is not None:
-            encoder_padding_mask = None
+            if cross_attention_key_value is None:
+                encoder_padding_mask = None
 
-            if encoder_attention_mask is not None:
-                expected_shape = encoder_hidden_states.shape[:2]
+                if encoder_attention_mask is not None:
+                    expected_shape = encoder_hidden_states.shape[:2]
 
-                if encoder_attention_mask.shape != expected_shape:
-                    raise ValueError(
-                        "encoder_attention_mask должна иметь форму "
-                        f"{expected_shape}, получено "
-                        f"{encoder_attention_mask.shape}"
-                    )
+                    if encoder_attention_mask.shape != expected_shape:
+                        raise ValueError(
+                            "encoder_attention_mask должна иметь форму "
+                            f"{expected_shape}, получено "
+                            f"{encoder_attention_mask.shape}"
+                        )
 
-                encoder_padding_mask = ~encoder_attention_mask.bool()
+                    encoder_padding_mask = ~encoder_attention_mask.bool()
 
-            cross_output, _ = self.cross_attn(
-                query=hidden_states,
-                key=encoder_hidden_states,
-                value=encoder_hidden_states,
-                key_padding_mask=encoder_padding_mask,
-                need_weights=False,
-            )
+                cross_output, _ = self.cross_attn(
+                    query=hidden_states,
+                    key=encoder_hidden_states,
+                    value=encoder_hidden_states,
+                    key_padding_mask=encoder_padding_mask,
+                    need_weights=False,
+                )
+            else:
+                cross_output = self._cross_attention_from_key_value(
+                    hidden_states=hidden_states,
+                    key_value=cross_attention_key_value,
+                    encoder_attention_mask=encoder_attention_mask,
+                )
 
             hidden_states, residual = self._add_residual_and_norm(
                 cross_output,
@@ -324,11 +455,23 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
     def set_decoder(self, decoder):
         self.model = decoder
 
+    def prepare_cross_attention_key_values(
+        self,
+        encoder_hidden_states: torch.Tensor,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        return tuple(
+            layer.prepare_cross_attention_key_value(
+                encoder_hidden_states
+            )
+            for layer in self.model.layers
+        )
+
     def forward(
         self,
         input_ids,
         decoder_attention_mask=None,
         encoder_attention_mask=None,
+        cross_attention_key_values=None,
         past_key_values=None,
         use_cache=None,
         return_dict=True,
@@ -357,7 +500,22 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
 
         hidden_states = self.model.embeddings(input_ids)
 
-        for layer in self.model.layers:
+        if (
+            cross_attention_key_values is not None
+            and len(cross_attention_key_values) != len(self.model.layers)
+        ):
+            raise ValueError(
+                "Число cross-attention K/V должно совпадать с "
+                f"числом decoder layers: {len(self.model.layers)}"
+            )
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            cross_attention_key_value = (
+                None
+                if cross_attention_key_values is None
+                else cross_attention_key_values[layer_idx]
+            )
+
             (
                 hidden_states,
                 _,
@@ -368,6 +526,7 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
                 encoder_hidden_states=encoder_hidden_states,
                 decoder_attention_mask=decoder_attention_mask,
                 encoder_attention_mask=encoder_attention_mask,
+                cross_attention_key_value=cross_attention_key_value,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_attentions=False,
@@ -824,17 +983,25 @@ class WhisperKDAModel(KDAPreTrainedModel):
             )
 
             past_key_values = None
+            cross_attention_key_values = None
+
+            if use_cache:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=torch.float16,
+                    enabled=(device.type == "cuda"),
+                ):
+                    cross_attention_key_values = (
+                        self.decoder.prepare_cross_attention_key_values(
+                            encoder_hidden_states
+                        )
+                    )
 
             while generated_ids.size(1) < stopping_length:
                 if use_cache and past_key_values is not None:
                     step_input_ids = generated_ids[:, -1:]
                 else:
                     step_input_ids = generated_ids
-
-                decoder_attention_mask = torch.ones_like(
-                    step_input_ids,
-                    dtype=torch.long,
-                )
 
                 with torch.autocast(
                     device_type=device.type,
@@ -844,8 +1011,11 @@ class WhisperKDAModel(KDAPreTrainedModel):
                     outputs = self.decoder(
                         input_ids=step_input_ids,
                         encoder_hidden_states=encoder_hidden_states,
-                        decoder_attention_mask=decoder_attention_mask,
+                        decoder_attention_mask=None,
                         encoder_attention_mask=encoder_attention_mask,
+                        cross_attention_key_values=(
+                            cross_attention_key_values
+                        ),
                         past_key_values=past_key_values,
                         use_cache=use_cache,
                         return_dict=True,
