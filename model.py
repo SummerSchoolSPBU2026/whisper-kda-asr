@@ -338,6 +338,9 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
         if input_ids is None:
             raise ValueError("Необходимо передать input_ids")
 
+        if decoder_attention_mask is None:
+            decoder_attention_mask = attention_mask
+
         use_cache = (
             self.config.use_cache
             if use_cache is None
@@ -387,7 +390,12 @@ class KDACrossAttentionDecoder(KDAPreTrainedModel, FLAGenerationMixin):
             )
 
         if not return_dict:
-            return logits, past_key_values
+            output = (logits, past_key_values)
+            return (
+                (loss,) + output
+                if loss is not None
+                else output
+            )
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -451,6 +459,8 @@ class WhisperKDAModel(KDAPreTrainedModel):
             bos_token_id=config.bos_token_id,
             eos_token_id=config.eos_token_id,
         )
+
+        self.post_init()
 
     def freeze_encoder(self):
         self.encoder.requires_grad_(False)
